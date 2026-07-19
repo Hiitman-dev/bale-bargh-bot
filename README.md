@@ -1,61 +1,63 @@
-# ربات مدیریت اطلاع‌رسانی خاموشی برق
+# ربات مدیریت اطلاع‌رسانی خاموشی برق (نسخه‌ی گیت‌هاب + کلادفلر)
 
-## قابلیت‌ها
-- فقط پیام‌های واقعی «خاموشی برنامه‌ریزی‌شده / رخ‌داده» از @Bargheman1_bot را در نظر می‌گیرد.
-- برای هر پیام، پیش‌نمایش با دکمه‌های ✅ ارسال / ✏️ ویرایش / ❌ لغو برایتان (فقط شما، به‌عنوان ادمین) می‌فرستد.
-- می‌توانید ارسال خودکار (بعد از X دقیقه بدون پاسخ) را روشن/خاموش و زمانش را تنظیم کنید.
-- می‌توانید گروه‌های مقصد پیش‌فرض را تعیین کنید (مثلاً فقط گروه ۱).
-- تاریخچه‌ی پیام‌های ارسال‌شده را با `/history` می‌بینید.
+## منبع پیام
+منبع پیام‌های خاموشی، ربات تلگرامی `@Bargheman1_bot` است (بله دیگر استفاده نمی‌شود). اگر
+لازم شد بعداً ربات دیگری جایگزینش شود، فقط کافیست مقدار پیش‌فرض `SOURCE_BOT` در
+`reader.py` را عوض کنید یا Secret اختیاری `SOURCE_BOT_USERNAME` را در ریپو تعریف کنید.
 
-## دستورات ربات مدیریت (فقط شما، ادمین، می‌توانید بفرستید)
-- `/groups` — لیست گروه‌های ثبت‌شده با شماره
-- `/setdefault 1,2` — فقط به گروه‌های شماره ۱ و ۲ بفرست؛ `/setdefault all` یعنی به همه
-- `/autosend on` یا `/autosend off` — روشن/خاموش کردن ارسال خودکار
-- `/timeout 15` — اگه ارسال خودکار روشن باشه، بعد از چند دقیقه بدون پاسخ خودش بفرسته
-- `/status` — وضعیت فعلی تنظیمات
-- `/history` — ۱۰ پیام آخر ارسال‌شده
+## معماری
+- **خواندن پیام (`reader.py`)** — روی GitHub Actions، هر ۵ دقیقه اجرا می‌شود. با اکانت شخصی
+  (Telethon) پیام‌های ربات منبع را می‌خواند، تاریخ/ساعت را استخراج می‌کند، در قالب درشت
+  می‌سازد و به Cloudflare Worker می‌فرستد. فعال‌سازی گروه‌ها (`/activate`) هم همین‌جا انجام می‌شود.
+- **ربات مدیریت (`worker/`)** — روی Cloudflare Workers، به‌صورت Webhook. پیش‌نمایش با دکمه برای
+  شما می‌فرستد، دستورات `/groups /setdefault /autosend /timeout /status /history` را مدیریت
+  می‌کند، و با Cron Trigger هر ۲ دقیقه تایم‌اوت‌ها را چک می‌کند.
+- **ارسال نهایی (`send.py`)** — چون ربات مدیریت عضو گروه‌ها نیست، وقتی شما تایید کنید یا
+  تایم‌اوت بخورد، Worker یک رویداد `repository_dispatch` به گیت‌هاب می‌فرستد و این اسکریپت با
+  اکانت شخصی پیام را واقعاً به گروه‌ها می‌فرستد.
 
-## مراحل راه‌اندازی
+## ۱. آماده‌سازی گیت‌هاب
 
-### ۱. ساخت ربات مدیریت
-توی تلگرام با `@BotFather` صحبت کنید:
-```
-/newbot
-```
-یک اسم و یوزرنیم (باید به bot ختم بشه) بدید. توکنی که می‌ده رو نگه دارید.
-
-### ۲. گرفتن آیدی عددی خودتان
-با `@userinfobot` در تلگرام `/start` بزنید، عدد `Id` را یادداشت کنید.
-
-### ۳. گرفتن api_id / api_hash (از my.telegram.org) و ساخت Session
-همان مراحل قبلی: `python login_once.py` را یک‌بار روی کامپیوتر خودتان اجرا کنید.
-
-### ۴. ساخت ریپوی خصوصی گیت‌هاب و آپلود فایل‌ها
-`main.py`، پوشه‌ی `.github`، و این `README.md` را آپلود کنید.
-
-### ۵. تنظیم Secrets
-در Settings → Secrets and variables → Actions:
+### Secrets ریپو (Settings → Secrets and variables → Actions)
 | Name | مقدار |
 |---|---|
-| `TELEGRAM_API_ID` | از my.telegram.org |
-| `TELEGRAM_API_HASH` | از my.telegram.org |
-| `TELEGRAM_SESSION` | از login_once.py |
-| `MANAGER_BOT_TOKEN` | از BotFather |
-| `ADMIN_USER_ID` | از userinfobot |
-| `ACTIVATION_CODE` | یک کد دلخواه و خصوصی |
+| `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | از my.telegram.org |
+| `TELEGRAM_SESSION` | خروجی `python login_once.py` (یک‌بار، روی کامپیوتر خودتان) |
+| `ACTIVATION_CODE` | یک کد دلخواه و خصوصی برای فعال‌سازی گروه‌ها |
+| `WORKER_BASE_URL` | آدرس Worker بعد از دیپلوی، مثلا `https://bargh-manager.YOURSUBDOMAIN.workers.dev` |
+| `WORKER_SHARED_SECRET` | یک رشته‌ی تصادفی دلخواه — باید دقیقاً با `READER_SECRET` روی Worker یکی باشد |
 
-### ۶. فعال‌سازی گروه‌ها
-در هر گروه (با اکانت شخصی خودتان) بنویسید:
+### فعال‌سازی گروه‌ها
+در هر گروه، با اکانت شخصی‌تان بنویسید: `/activate <ACTIVATION_CODE>`
+
+## ۲. دیپلوی Cloudflare Worker
+
+```bash
+cd worker
+npm install
+npx wrangler kv namespace create BARGH_KV
+# آی‌دی خروجی رو توی wrangler.toml جای REPLACE_WITH_YOUR_KV_NAMESPACE_ID بذارید
+
+npx wrangler secret put MANAGER_BOT_TOKEN     # توکن ربات مدیریت از BotFather
+npx wrangler secret put ADMIN_USER_ID         # آیدی عددی شما از userinfobot
+npx wrangler secret put READER_SECRET         # همون مقدار WORKER_SHARED_SECRET بالا
+npx wrangler secret put GITHUB_TOKEN          # PAT با اسکوپ repo، فقط برای این ریپو
+npx wrangler secret put GITHUB_REPO           # مثلا yourusername/bargh-manager
+
+npx wrangler deploy
 ```
-/activate <ACTIVATION_CODE>
+
+بعد از دیپلوی، وب‌هوک تلگرام را روی آدرس Worker تنظیم کنید:
+
+```bash
+curl "https://api.telegram.org/bot<MANAGER_BOT_TOKEN>/setWebhook?url=https://bargh-manager.YOURSUBDOMAIN.workers.dev/webhook"
 ```
 
-### ۷. شروع مکالمه با ربات مدیریت
-با ربات جدیدتان `/start` بزنید تا بتواند به شما پیام بدهد (تلگرام اجازه نمی‌دهد ربات‌ها اول پیام بدهند).
+با ربات مدیریت `/start` بزنید (تلگرام اجازه نمی‌دهد ربات‌ها اول پیام بدهند).
 
-از این پس، هر پیام خاموشی جدید از @Bargheman1_bot، اول برای تایید شما در همین چت می‌آید.
-
-## نکات امنیتی
-- `TELEGRAM_SESSION` معادل رمز اکانت شخصی شماست، فقط در Secrets نگه دارید.
-- ریپو را Private نگه دارید.
-- فقط `ADMIN_USER_ID` شما به دستورات و دکمه‌ها دسترسی دارد؛ بقیه حتی اگر به ربات مدیریت پیام بدهند نادیده گرفته می‌شوند.
+## نکات مهم
+- `GITHUB_TOKEN` باید Fine-grained PAT با دسترسی نوشتن روی همین ریپو (Actions/Contents) باشد.
+- Worker روی پلن رایگان کلادفلر هم کار می‌کند؛ اگر تعداد پیام‌ها/گروه‌ها خیلی زیاد شد،
+  محدودیت CPU هر Cron (۱۰ میلی‌ثانیه در پلن رایگان) ممکن است تنگ باشد — در آن صورت پلن
+  Paid ($5/ماه) پیشنهاد می‌شود.
+- ریپوی گیت‌هاب را Private نگه دارید؛ `TELEGRAM_SESSION` معادل رمز اکانت شخصی شماست.

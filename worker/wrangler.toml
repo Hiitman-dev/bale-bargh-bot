@@ -1,0 +1,10 @@
+name = "bargh-manager"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+
+kv_namespaces = [
+  { binding = "BARGH_KV", id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+]
+
+[triggers]
+crons = ["*/2 * * * *"]

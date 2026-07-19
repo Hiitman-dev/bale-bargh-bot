@@ -1,0 +1,43 @@
+name: Bargh Reader
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # گیت‌هاب کمتر از ۵ دقیقه رو تضمین نمی‌کنه، پس همینو نگه دار
+  workflow_dispatch: {}
+
+concurrency:
+  group: bargh-reader
+  cancel-in-progress: false   # اگه اجرای قبلی هنوز تموم نشده، صف بشه نه هم‌زمان اجرا بشه
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run reader.py
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+          ACTIVATION_CODE: ${{ secrets.ACTIVATION_CODE }}
+          WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
+          WORKER_SHARED_SECRET: ${{ secrets.WORKER_SHARED_SECRET }}
+        run: python reader.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "bargh-reader"
+          git config user.email "bargh-reader@users.noreply.github.com"
+          git add state.json groups.json
+          git diff --cached --quiet || git commit -m "update reader state"
+          git push
