@@ -49,15 +49,24 @@ TEHRAN_TZ = ZoneInfo("Asia/Tehran")
 STATE_FILE = "state.json"
 GROUPS_FILE = "groups.json"  # فقط رکورد محلی، برای جلوگیری از ثبت تکراری یک گروه
 
-OUTAGE_PATTERN = re.compile(r"خاموشی\s*(برنامه‌ریزی‌شده|رخ‌داده|رخداده)")
-DATETIME_PATTERN = re.compile(
-    r"•\s*(?P<date>\d{4}/\d{2}/\d{2})\s*\|\s*(?P<start>\d{2}:\d{2})\s*تا\s*(?P<end>\d{2}:\d{2})"
-)
+# هر دو فرمتی که ربات منبع می‌فرسته رو پوشش می‌ده:
+#   فرمت ۱: "⚠️ هشدار خاموشی برق" + خطوط "📅 تاریخ:" و "⏰ ساعت: ... تا ..."
+#   فرمت ۲: "⚠️ خاموشی برنامه‌ریزی‌شده/رخ‌داده" + خط "• تاریخ | ساعت تا ساعت"
+OUTAGE_PATTERN = re.compile(r"⚠️.*?(هشدار خاموشی برق|خاموشی\s*(برنامه‌ریزی‌شده|رخ‌داده|رخداده))")
+
+DATE_PATTERN = re.compile(r"(?P<date>\d{4}/\d{2}/\d{2})")
+TIME_PATTERN = re.compile(r"(?P<start>\d{2}:\d{2})\s*تا\s*(?P<end>\d{2}:\d{2})")
+ADDRESS_PATTERN = re.compile(r"📍\s*(?:آدرس:\s*)?(?P<address>.+)")
+LABEL_PATTERN = re.compile(r"🏠\s*(?:قبض:\s*)?(?P<label>.+)")
+TYPE_PATTERN = re.compile(r"(?:📌\s*نوع:\s*|⚠️\s*خاموشی\s*)(?P<type>برنامه‌ریزی‌شده|رخ‌داده|رخداده)")
 
 TEMPLATE = (
     "⚡️ <b>اطلاعیه خاموشی برق</b>\n\n"
+    "🏠 <b>قبض:</b> {label}\n"
+    "📌 <b>نوع:</b> {type}\n"
     "🗓 <b>تاریخ:</b> {date}\n"
-    "⏰ <b>ساعت:</b> {start} تا {end}"
+    "⏰ <b>ساعت:</b> {start} تا {end}\n"
+    "📍 <b>آدرس:</b> {address}"
 )
 
 
@@ -74,10 +83,23 @@ def save_json(path, data):
 
 
 def format_message(raw_text):
-    m = DATETIME_PATTERN.search(raw_text)
-    if not m:
-        return None  # خاموشیه ولی تاریخ/ساعتش با فرمت شناخته‌شده مطابقت نداره
-    return TEMPLATE.format(**m.groupdict())
+    date_m = DATE_PATTERN.search(raw_text)
+    time_m = TIME_PATTERN.search(raw_text)
+    if not date_m or not time_m:
+        return None  # خاموشیه ولی تاریخ/ساعتش قابل استخراج نبود
+
+    address_m = ADDRESS_PATTERN.search(raw_text)
+    label_m = LABEL_PATTERN.search(raw_text)
+    type_m = TYPE_PATTERN.search(raw_text)
+
+    return TEMPLATE.format(
+        label=label_m.group("label").strip() if label_m else "-",
+        type=type_m.group("type") if type_m else "-",
+        date=date_m.group("date"),
+        start=time_m.group("start"),
+        end=time_m.group("end"),
+        address=address_m.group("address").strip() if address_m else "-",
+    )
 
 
 def send_pending_to_worker(text):
