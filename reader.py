@@ -8,6 +8,8 @@ reader.py
 ۲. هر پیام آماده را با یک درخواست HTTP به ربات مدیریت (روی Cloudflare Worker) می‌فرستد.
 ۳. دستور /activate <CODE> در گروه‌ها را تشخیص می‌دهد و گروه را هم به Worker
    ثبت می‌کند و هم به‌صورت محلی نگه می‌دارد تا دوباره ثبت نشود.
+۴. در ساعت‌های مشخص‌شده در STATUS_QUERY_TIMES (به وقت تهران)، خودش دستور /status را
+   به ربات منبع می‌فرستد و اگر جواب شامل تاریخ/ساعت خاموشی بود، همان را هم فوروارد می‌کند.
 
 نکته: اولین اجرا فقط baseline پیام‌ها را ثبت می‌کند و چیزی نمی‌فرستد،
 تا کل تاریخچه‌ی قدیمی به‌عنوان "پیام جدید" سیل نشود.
@@ -18,11 +20,15 @@ reader.py
   ACTIVATION_CODE                                         -> کد فعال‌سازی گروه‌ها
   WORKER_BASE_URL                                         -> مثلا https://bargh-manager.xxx.workers.dev
   WORKER_SHARED_SECRET                                    -> باید دقیقاً با READER_SECRET روی Worker یکی باشد
+  STATUS_QUERY_TIMES                                      -> اختیاری. مثلا "07:00,13:00,20:00" (به وقت تهران)
 """
 
 import json
 import os
 import re
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 from telethon.sync import TelegramClient
@@ -36,6 +42,9 @@ SOURCE_BOT = os.environ.get("SOURCE_BOT_USERNAME", "Bargheman1_bot")
 ACTIVATION_CODE = os.environ["ACTIVATION_CODE"]
 WORKER_BASE_URL = os.environ["WORKER_BASE_URL"].rstrip("/")
 WORKER_SECRET = os.environ["WORKER_SHARED_SECRET"]
+STATUS_QUERY_TIMES = [t.strip() for t in os.environ.get("STATUS_QUERY_TIMES", "").split(",") if t.strip()]
+
+TEHRAN_TZ = ZoneInfo("Asia/Tehran")
 
 STATE_FILE = "state.json"
 GROUPS_FILE = "groups.json"  # فقط رکورد محلی، برای جلوگیری از ثبت تکراری یک گروه
@@ -91,8 +100,7 @@ def register_group_with_worker(chat_id, title):
     r.raise_for_status()
 
 
-def poll_source(client, state):
-    source_entity = client.get_entity(SOURCE_BOT)
+def poll_source(client, source_entity, state):
     first_run = "last_source_id" not in state
     last_id = state.get("last_source_id", 0)
     new_last_id = last_id
@@ -111,6 +119,42 @@ def poll_source(client, state):
 
     state["last_source_id"] = new_last_id
     return formatted_texts
+
+
+def due_status_check_times(state):
+    """کدوم زمان‌های تنظیم‌شده الان (±۵ دقیقه، به وقت تهران) سررسیدن و امروز هنوز چک نشدن؟
+    به‌عنوان side effect، بلافاصله در state به‌عنوان چک‌شده‌ی امروز علامت می‌زنه."""
+    if not STATUS_QUERY_TIMES:
+        return []
+
+    now = datetime.now(TEHRAN_TZ)
+    today = now.strftime("%Y-%m-%d")
+    sent = state.setdefault("status_sent", {})
+    due = []
+
+    for t in STATUS_QUERY_TIMES:
+        try:
+            hh, mm = (int(x) for x in t.split(":"))
+        except ValueError:
+            continue
+        target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        diff_minutes = (now - target).total_seconds() / 60
+        if 0 <= diff_minutes < 5 and sent.get(t) != today:
+            due.append(t)
+            sent[t] = today
+
+    return due
+
+
+def query_status(client, source_entity):
+    """دستور /status رو به ربات منبع می‌فرسته و منتظر جواب می‌مونه."""
+    sent_msg = client.send_message(source_entity, "/status")
+    time.sleep(5)
+    for reply in client.get_messages(source_entity, min_id=sent_msg.id, limit=5):
+        if reply.out:
+            continue  # پیام خودمون رو نادیده بگیر، فقط جواب ربات مهمه
+        return reply.text
+    return None
 
 
 def poll_group_activations(client, state, groups):
@@ -145,8 +189,18 @@ def main():
     groups = load_json(GROUPS_FILE, {})
 
     with TelegramClient(StringSession(SESSION), API_ID, API_HASH) as client:
-        new_texts = poll_source(client, state)
+        source_entity = client.get_entity(SOURCE_BOT)
+
+        new_texts = poll_source(client, source_entity, state)
         poll_group_activations(client, state, groups)
+
+        due_times = due_status_check_times(state)
+        for t in due_times:
+            reply_text = query_status(client, source_entity)
+            if reply_text:
+                formatted = format_message(reply_text)
+                if formatted:
+                    new_texts.append(formatted)
 
     for text in new_texts:
         send_pending_to_worker(text)

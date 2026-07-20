@@ -6,6 +6,13 @@
 //   POST /webhook      <- وب‌هوک تلگرام برای ربات مدیریت (دکمه‌ها و دستورات)
 // scheduled()          <- Cron Trigger؛ هر چند دقیقه تایم‌اوت‌ها رو چک می‌کنه
 
+import nacl from "tweetnacl";
+import sealedbox from "tweetnacl-sealedbox-js";
+
+// فقط همین سکرت‌های کم‌ریسک از طریق تلگرام قابل تغییرن — عمداً محدود شده،
+// چیزی مثل TELEGRAM_SESSION هرگز نباید از این مسیر عوض بشه.
+const EDITABLE_SECRETS = ["STATUS_QUERY_TIMES", "ACTIVATION_CODE"];
+
 const OK = (body = {}) =>
   new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
 const ERR = (msg, status = 400) =>
@@ -33,11 +40,78 @@ async function getJSON(env, key, fallback) {
 
 const setJSON = (env, key, value) => env.BARGH_KV.put(key, JSON.stringify(value));
 
-function groupListText(groups) {
+function groupsText(groups) {
   const entries = Object.entries(groups);
-  if (!entries.length) return "هنوز هیچ گروهی ثبت نشده.";
-  return entries.map(([id, title], i) => `${i + 1}. ${title}  (id: ${id})`).join("\n");
+  if (!entries.length) return "📋 <b>گروه‌ها</b>\n\nهنوز هیچ گروهی ثبت نشده.";
+  const lines = entries.map(([id, title], i) => `${i + 1}. <b>${title}</b>\n    <code>${id}</code>`);
+  return "📋 <b>گروه‌های ثبت‌شده</b>\n\n" + lines.join("\n\n");
 }
+
+function statusText(groups, settings, pendingCount) {
+  const targets = resolveTargets(groups, settings);
+  return (
+    `📊 <b>وضعیت فعلی</b>\n\n` +
+    `${settings.autosend ? "🟢" : "🔴"} ارسال خودکار: <b>${settings.autosend ? "روشن" : "خاموش"}</b>\n` +
+    `⏱ زمان انتظار: <b>${settings.timeout_minutes || 15}</b> دقیقه\n` +
+    `📍 گروه‌های مقصد: <b>${targets.length}</b> از ${Object.keys(groups).length}\n` +
+    `📨 پیام‌های در انتظار: <b>${pendingCount}</b>`
+  );
+}
+
+function historyText(history) {
+  if (!history.length) return "🕘 <b>تاریخچه</b>\n\nهنوز پیامی ارسال نشده.";
+  const lines = history
+    .slice(-10)
+    .reverse()
+    .map((h) => {
+      const d = new Date(h.sent_at);
+      const time = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+      const mode = h.mode === "auto-timeout" ? "⏱ خودکار" : "✅ دستی";
+      const clean = h.text.replace(/<[^>]+>/g, "").replace(/\n/g, " ").slice(0, 60);
+      return `${mode} — ${time}\n${clean}…`;
+    });
+  return "🕘 <b>۱۰ پیام آخر</b>\n\n" + lines.join("\n\n");
+}
+
+function mainMenuKeyboard(settings) {
+  return {
+    inline_keyboard: [
+      [
+        { text: "📋 گروه‌ها", callback_data: "menu:groups" },
+        { text: "📊 وضعیت", callback_data: "menu:status" },
+      ],
+      [
+        {
+          text: settings.autosend ? "🔴 خاموش کردن ارسال خودکار" : "🟢 روشن کردن ارسال خودکار",
+          callback_data: "menu:autosend_toggle",
+        },
+      ],
+      [
+        { text: "⏱ زمان انتظار", callback_data: "menu:timeout" },
+        { text: "🕘 تاریخچه", callback_data: "menu:history" },
+      ],
+    ],
+  };
+}
+
+function timeoutPickerKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: "۵", callback_data: "timeout:5" },
+        { text: "۱۰", callback_data: "timeout:10" },
+        { text: "۱۵", callback_data: "timeout:15" },
+      ],
+      [
+        { text: "۳۰", callback_data: "timeout:30" },
+        { text: "۶۰", callback_data: "timeout:60" },
+      ],
+      [{ text: "‹ بازگشت", callback_data: "menu:main" }],
+    ],
+  };
+}
+
+const BACK_KEYBOARD = { inline_keyboard: [[{ text: "‹ بازگشت", callback_data: "menu:main" }]] };
 
 function resolveTargets(groups, settings) {
   const def = settings.default_group_ids;
@@ -45,21 +119,53 @@ function resolveTargets(groups, settings) {
   return Object.keys(groups);
 }
 
-async function dispatchToGitHub(env, text, targets) {
-  const r = await fetch(`https://api.github.com/repos/${env.GITHUB_REPO}/dispatches`, {
-    method: "POST",
+async function githubApi(env, method, path, body) {
+  const r = await fetch(`https://api.github.com/repos/${env.GITHUB_REPO}${path}`, {
+    method,
     headers: {
       authorization: `Bearer ${env.GITHUB_TOKEN}`,
       accept: "application/vnd.github+json",
       "content-type": "application/json",
       "user-agent": "bargh-manager-worker",
     },
-    body: JSON.stringify({
-      event_type: env.GITHUB_EVENT_TYPE || "send-outage",
-      client_payload: { text, chat_ids: targets },
-    }),
+    body: body ? JSON.stringify(body) : undefined,
   });
-  if (!r.ok) throw new Error(`GitHub dispatch failed: ${r.status} ${await r.text()}`);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(`GitHub API error ${r.status}: ${JSON.stringify(data)}`);
+  return data;
+}
+
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+function bytesToBase64(bytes) {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+async function setGithubSecret(env, name, value) {
+  const keyInfo = await githubApi(env, "GET", "/actions/secrets/public-key");
+  const publicKey = base64ToBytes(keyInfo.key);
+  const messageBytes = new TextEncoder().encode(value);
+  const encryptedBytes = sealedbox.seal(messageBytes, publicKey);
+  await githubApi(env, "PUT", `/actions/secrets/${name}`, {
+    encrypted_value: bytesToBase64(encryptedBytes),
+    key_id: keyInfo.key_id,
+  });
+}
+
+async function sendToGroups(env, text, targets) {
+  const results = [];
+  for (const chatId of targets) {
+    const r = await tg(env, "sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
+    results.push({ chatId, ok: !!r.ok, description: r.description });
+  }
+  return results;
 }
 
 async function pushHistory(env, entry) {
@@ -73,10 +179,16 @@ async function createPendingPreview(env, pid, entry) {
   const settings = await getJSON(env, "settings", DEFAULT_SETTINGS);
   const targets = resolveTargets(groups, settings);
   const preview =
-    `📨 پیام جدید خاموشی دریافت شد:\n\n${entry.text}\n\n` +
-    `مقصد فعلی: ${targets.length} گروه\n` +
-    `⏱ اگه ظرف ${settings.timeout_minutes || 15} دقیقه پاسخ ندید` +
-    (settings.autosend ? " و ارسال خودکار روشنه، خودکار ارسال می‌شه." : "، ارسال نمی‌شه (ارسال خودکار خاموشه).");
+    `📨 <b>خاموشی جدید دریافت شد</b>\n` +
+    `━━━━━━━━━━━━━━\n` +
+    `${entry.text}\n` +
+    `━━━━━━━━━━━━━━\n\n` +
+    `📍 مقصد فعلی: <b>${targets.length}</b> گروه\n` +
+    `⏱ ${
+      settings.autosend
+        ? `اگه ظرف <b>${settings.timeout_minutes || 15}</b> دقیقه پاسخ ندی، خودکار ارسال می‌شه.`
+        : "ارسال خودکار خاموشه — منتظر تایید توئه."
+    }`;
   const keyboard = {
     inline_keyboard: [[
       { text: "✅ ارسال", callback_data: `send:${pid}` },
@@ -108,11 +220,50 @@ async function handleGroupsApi(req, env) {
   return OK();
 }
 
+async function handleMenuCallback(data, env) {
+  const groups = await getJSON(env, "groups", {});
+  const settings = await getJSON(env, "settings", DEFAULT_SETTINGS);
+
+  if (data === "menu:main") return sendToAdmin(env, "🏠 <b>منوی اصلی</b>", mainMenuKeyboard(settings));
+  if (data === "menu:groups") return sendToAdmin(env, groupsText(groups), BACK_KEYBOARD);
+  if (data === "menu:history") {
+    const history = await getJSON(env, "history", []);
+    return sendToAdmin(env, historyText(history), BACK_KEYBOARD);
+  }
+  if (data === "menu:status") {
+    const pendingList = await env.BARGH_KV.list({ prefix: "pending:" });
+    return sendToAdmin(env, statusText(groups, settings, pendingList.keys.length), BACK_KEYBOARD);
+  }
+  if (data === "menu:autosend_toggle") {
+    settings.autosend = !settings.autosend;
+    await setJSON(env, "settings", settings);
+    return sendToAdmin(
+      env,
+      settings.autosend ? "🟢 ارسال خودکار روشن شد." : "🔴 ارسال خودکار خاموش شد.",
+      mainMenuKeyboard(settings)
+    );
+  }
+  if (data === "menu:timeout") {
+    return sendToAdmin(env, "⏱ چند دقیقه صبر کنه قبل از ارسال خودکار؟", timeoutPickerKeyboard());
+  }
+  if (data.startsWith("timeout:")) {
+    const minutes = parseInt(data.split(":")[1], 10);
+    settings.timeout_minutes = minutes;
+    await setJSON(env, "settings", settings);
+    return sendToAdmin(env, `✅ زمان انتظار روی <b>${minutes}</b> دقیقه تنظیم شد.`, mainMenuKeyboard(settings));
+  }
+}
+
 async function handleCallbackQuery(cq, env) {
   if (String(cq.from.id) !== String(env.ADMIN_USER_ID)) return;
-  const [action, pid] = cq.data.split(":");
+  const data = cq.data;
   await tg(env, "answerCallbackQuery", { callback_query_id: cq.id });
 
+  if (data.startsWith("menu:") || data.startsWith("timeout:")) {
+    return handleMenuCallback(data, env);
+  }
+
+  const [action, pid] = data.split(":");
   const entry = await getJSON(env, `pending:${pid}`, null);
   if (!entry) return sendToAdmin(env, "این پیام قبلاً پردازش شده.");
 
@@ -121,10 +272,10 @@ async function handleCallbackQuery(cq, env) {
 
   if (action === "send") {
     const targets = resolveTargets(groups, settings);
-    await dispatchToGitHub(env, entry.text, targets);
+    await sendToGroups(env, entry.text, targets);
     await pushHistory(env, { text: entry.text, sent_at: Date.now(), mode: "manual", targets });
     await env.BARGH_KV.delete(`pending:${pid}`);
-    await sendToAdmin(env, `✅ ارسال به ${targets.length} گروه آغاز شد.`);
+    await sendToAdmin(env, `✅ به ${targets.length} گروه ارسال شد.`);
   } else if (action === "cancel") {
     await env.BARGH_KV.delete(`pending:${pid}`);
     await sendToAdmin(env, "❌ لغو شد، ارسال نمی‌شود.");
@@ -165,7 +316,7 @@ async function handleTextMessage(text, env) {
   const settings = await getJSON(env, "settings", DEFAULT_SETTINGS);
 
   if (text === "/groups") {
-    return sendToAdmin(env, groupListText(groups));
+    return sendToAdmin(env, groupsText(groups));
   }
   if (text.startsWith("/setdefault")) {
     const parts = text.split(/\s+/);
@@ -185,6 +336,31 @@ async function handleTextMessage(text, env) {
       return sendToAdmin(env, `خطا در فرمت دستور: ${e}`);
     }
   }
+  if (text.startsWith("/setsecret")) {
+    const parts = text.split(/\s+/);
+    if (parts.length < 3) {
+      return sendToAdmin(
+        env,
+        `فرمت درست: /setsecret NAME value\n\nفقط این سکرت‌ها از تلگرام قابل تغییرن:\n${EDITABLE_SECRETS.join(
+          "\n"
+        )}`
+      );
+    }
+    const name = parts[1];
+    if (!EDITABLE_SECRETS.includes(name)) {
+      return sendToAdmin(
+        env,
+        `❌ سکرت «${name}» از طریق تلگرام قابل تغییر نیست.\n\nفقط این‌ها مجازن:\n${EDITABLE_SECRETS.join("\n")}`
+      );
+    }
+    const value = text.slice(text.indexOf(parts[1]) + parts[1].length + 1);
+    try {
+      await setGithubSecret(env, name, value);
+      return sendToAdmin(env, `✅ سکرت <b>${name}</b> روی گیت‌هاب به‌روزرسانی شد.\n\n⚠️ پیشنهاد می‌کنم همین پیام رو از چت پاک کنی.`);
+    } catch (e) {
+      return sendToAdmin(env, `❌ خطا در تنظیم سکرت: ${e.message}`);
+    }
+  }
   if (text.startsWith("/autosend")) {
     const parts = text.split(/\s+/);
     if (parts.length < 2 || !["on", "off"].includes(parts[1])) return sendToAdmin(env, "فرمت درست: /autosend on یا /autosend off");
@@ -200,38 +376,44 @@ async function handleTextMessage(text, env) {
     return sendToAdmin(env, `زمان انتظار روی ${settings.timeout_minutes} دقیقه تنظیم شد.`);
   }
   if (text === "/status") {
-    const targets = resolveTargets(groups, settings);
     const pendingList = await env.BARGH_KV.list({ prefix: "pending:" });
-    return sendToAdmin(
-      env,
-      `ارسال خودکار: ${settings.autosend ? "روشن" : "خاموش"}\n` +
-        `زمان انتظار: ${settings.timeout_minutes || 15} دقیقه\n` +
-        `گروه‌های مقصد فعلی: ${targets.length} از ${Object.keys(groups).length}\n` +
-        `پیام‌های در انتظار: ${pendingList.keys.length}`
-    );
+    return sendToAdmin(env, statusText(groups, settings, pendingList.keys.length));
   }
   if (text === "/history") {
     const history = await getJSON(env, "history", []);
-    if (!history.length) return sendToAdmin(env, "هنوز پیامی ارسال نشده.");
-    const lines = history.slice(-10).map((h) => {
-      const d = new Date(h.sent_at).toISOString().slice(0, 16).replace("T", " ");
-      const mode = h.mode === "auto-timeout" ? "خودکار" : "دستی";
-      return `[${d}] (${mode}) ${h.text.replace(/<[^>]+>/g, "").slice(0, 50)}...`;
-    });
-    return sendToAdmin(env, "۱۰ پیام آخر:\n\n" + lines.join("\n\n"));
+    return sendToAdmin(env, historyText(history));
   }
   if (text === "/help" || text === "/start") {
     return sendToAdmin(
       env,
-      "دستورات:\n" +
-        "/groups - لیست گروه‌های ثبت‌شده\n" +
-        "/setdefault 1,2 - تعیین گروه‌های مقصد پیش‌فرض\n" +
-        "/autosend on|off - روشن/خاموش کردن ارسال خودکار\n" +
-        "/timeout 15 - تعیین دقیقه‌ی انتظار قبل از ارسال خودکار\n" +
-        "/status - وضعیت فعلی\n" +
-        "/history - پیام‌های اخیر ارسال‌شده"
+      "👋 <b>سلام!</b> به ربات مدیریت اطلاع‌رسانی خاموشی برق خوش اومدی.\n\n" +
+        "از دکمه‌های زیر استفاده کن، یا این دستورات رو مستقیم بفرست:\n" +
+        "<code>/setdefault 1,2</code> - تعیین گروه‌های مقصد پیش‌فرض\n" +
+        "<code>/setdefault all</code> - ارسال به همه‌ی گروه‌ها\n" +
+        `<code>/setsecret NAME value</code> - تغییر ${EDITABLE_SECRETS.join(" یا ")} روی گیت‌هاب`,
+      mainMenuKeyboard(settings)
     );
   }
+}
+
+async function handleGroupMessage(msg, env) {
+  const text = (msg.text || "").trim();
+  const m = text.match(/^\/activate(?:@\w+)?\s+(.+)$/);
+  if (!m) return; // فقط به /activate واکنش نشون بده، توی گروه شلوغ نکن
+  const code = m[1].trim();
+  if (code !== env.ACTIVATION_CODE) return; // کد اشتباهه، بی‌صدا نادیده بگیر
+
+  const chatId = String(msg.chat.id);
+  const groups = await getJSON(env, "groups", {});
+  if (chatId in groups) {
+    return tg(env, "sendMessage", { chat_id: chatId, text: "این گروه از قبل فعال شده." });
+  }
+  groups[chatId] = msg.chat.title || chatId;
+  await setJSON(env, "groups", groups);
+  return tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: "✅ این گروه با موفقیت برای دریافت اطلاع‌رسانی خاموشی برق فعال شد.",
+  });
 }
 
 async function handleWebhook(req, env) {
@@ -241,7 +423,14 @@ async function handleWebhook(req, env) {
     return OK();
   }
   const msg = update.message;
-  if (!msg || String(msg.from?.id) !== String(env.ADMIN_USER_ID)) return OK();
+  if (!msg) return OK();
+
+  if (msg.chat && (msg.chat.type === "group" || msg.chat.type === "supergroup")) {
+    await handleGroupMessage(msg, env);
+    return OK();
+  }
+
+  if (String(msg.from?.id) !== String(env.ADMIN_USER_ID)) return OK();
   const text = (msg.text || "").trim();
   if (text) await handleTextMessage(text, env);
   return OK();
@@ -260,7 +449,7 @@ async function checkTimeouts(env) {
     if (!entry || entry.awaiting_edit) continue;
     if (now - entry.created_at >= timeoutMs) {
       const targets = resolveTargets(groups, settings);
-      await dispatchToGitHub(env, entry.text, targets);
+      await sendToGroups(env, entry.text, targets);
       await pushHistory(env, { text: entry.text, sent_at: now, mode: "auto-timeout", targets });
       await env.BARGH_KV.delete(key.name);
       await sendToAdmin(env, `⏱ زمان تمام شد، پیام خودکار ارسال شد به ${targets.length} گروه.`);

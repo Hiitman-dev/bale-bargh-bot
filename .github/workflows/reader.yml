@@ -32,6 +32,7 @@ jobs:
           ACTIVATION_CODE: ${{ secrets.ACTIVATION_CODE }}
           WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
           WORKER_SHARED_SECRET: ${{ secrets.WORKER_SHARED_SECRET }}
+          STATUS_QUERY_TIMES: ${{ secrets.STATUS_QUERY_TIMES }}
         run: python reader.py
 
       - name: Commit updated state

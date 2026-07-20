@@ -1,0 +1,1 @@
+import{Kn as e,Rn as t}from"./index-BPLH0X4i.js";var n=e(),r=()=>(0,n.jsx)(t,{});export{r as component};
