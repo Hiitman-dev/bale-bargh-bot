@@ -130,6 +130,21 @@ def register_group_with_worker(chat_id, title):
     r.raise_for_status()
 
 
+def send_log_to_worker(text):
+    """گزارش این اجرا رو مستقیم برای ادمین توی ربات مدیریت می‌فرسته (برای مانیتورینگ).
+    عمداً خطاش کل اجرا رو کرش نمی‌ده — گزارش صرفاً informational هست."""
+    try:
+        r = requests.post(
+            f"{WORKER_BASE_URL}/api/log",
+            headers={"X-Reader-Secret": WORKER_SECRET},
+            json={"text": text},
+            timeout=15,
+        )
+        r.raise_for_status()
+    except Exception as e:
+        print(f"⚠️ فرستادن گزارش مانیتورینگ به Worker شکست خورد: {e}")
+
+
 def poll_source(client, source_entity, state, new_texts):
     first_run = "sent_fingerprints" not in state
     checked = added = 0
@@ -142,20 +157,24 @@ def poll_source(client, source_entity, state, new_texts):
     prune_fingerprints(state.setdefault("sent_fingerprints", {}))
     tag = "اولین اجرا (فقط baseline)" if first_run else "بررسی معمول"
     print(f"📡 [{tag}] {checked} پیام اخیر از {SOURCE_BOT} بررسی شد، {added} خاموشی جدید پیدا شد.")
+    return {"checked": checked, "added": added, "first_run": first_run}
 
 
 def due_status_check_times(state):
     """کدوم زمان‌های تنظیم‌شده امروز (به وقت تهران) گذشتن و هنوز چک نشدن؟
     به‌عنوان side effect، بلافاصله در state به‌عنوان چک‌شده‌ی امروز علامت می‌زنه.
+    علاوه بر لیست سررسیده‌ها، یه خط وضعیت برای هر ساعت تنظیم‌شده هم برمی‌گردونه
+    (برای گزارش مانیتورینگ، حتی وقتی چیزی سررسیده نیست).
 
     عمداً پنجره‌ی زمانی محدود نداره (فقط >= زمان هدف)، چون گیت‌هاب اکشنز
     زمان‌بندی‌های schedule رو گاهی با تاخیر قابل‌توجه (۱۰-۲۰+ دقیقه) اجرا می‌کنه؛
     یه پنجره‌ی باریک باعث می‌شد در تاخیرهای طولانی، اون روز کلاً رد بشه."""
     now = datetime.now(TEHRAN_TZ)
+    status_lines = []
 
     if not STATUS_QUERY_TIMES:
         print("⏱ STATUS_QUERY_TIMES تنظیم نشده (یا خالیه) — این قابلیت غیرفعاله.")
-        return []
+        return [], status_lines
 
     today = now.strftime("%Y-%m-%d")
     sent = state.setdefault("status_sent", {})
@@ -167,19 +186,23 @@ def due_status_check_times(state):
         try:
             hh, mm = (int(x) for x in t.split(":"))
         except ValueError:
-            print(f"   ⚠️ «{t}» فرمت درستی نیست، باید HH:MM باشه (مثلا 07:00).")
+            line = f"{t}: فرمت نامعتبر (باید HH:MM باشه)"
+            print(f"   ⚠️ {line}")
+            status_lines.append(line)
             continue
         target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
         if sent.get(t) == today:
-            print(f"   {t}: امروز قبلاً چک شده، دوباره لازم نیست.")
+            line = f"{t}: امروز قبلاً چک شده"
         elif now < target:
-            print(f"   {t}: هنوز نرسیده.")
+            line = f"{t}: هنوز نرسیده"
         else:
-            print(f"   {t}: سررسیده و امروز چک نشده -> الان /status می‌فرستم.")
+            line = f"{t}: سررسیده -> در حال فرستادن /status"
             due.append(t)
             sent[t] = today
+        print(f"   {line}")
+        status_lines.append(line)
 
-    return due
+    return due, status_lines
 
 
 def query_status(client, source_entity):
@@ -223,35 +246,41 @@ def poll_group_activations(client, state, groups):
 
     state["last_group_ids"] = last_group_ids
     print(f"👥 {checked_dialogs} گروه/سوپرگروه بررسی شد، {activated_now} گروه تازه فعال شد.")
+    return {"checked": checked_dialogs, "activated": activated_now}
 
 
 def main():
     state = load_json(STATE_FILE, {})
     groups = load_json(GROUPS_FILE, {})
     new_texts = []
+    status_results = []
 
     with TelegramClient(StringSession(SESSION), API_ID, API_HASH) as client:
         source_entity = client.get_entity(SOURCE_BOT)
         print(f"✅ به {SOURCE_BOT} وصل شد (id={source_entity.id}).")
 
-        poll_source(client, source_entity, state, new_texts)
-        poll_group_activations(client, state, groups)
+        source_stats = poll_source(client, source_entity, state, new_texts)
+        group_stats = poll_group_activations(client, state, groups)
 
-        due_times = due_status_check_times(state)
+        due_times, status_lines = due_status_check_times(state)
         for t in due_times:
-            print(f"⏱ زمان چک وضعیت رسیده: {t} — در حال فرستادن /status ...")
+            print(f"⏱ در حال فرستادن /status برای {t} ...")
             reply_text = query_status(client, source_entity)
             if reply_text is None:
-                print("   ⚠️ جوابی از ربات دریافت نشد.")
+                result = f"{t}: جوابی از ربات دریافت نشد ⚠️"
             elif consider_text(reply_text, state, new_texts):
-                print("   ✅ خاموشی جدید در پاسخ /status پیدا شد.")
+                result = f"{t}: خاموشی جدید در پاسخ پیدا شد ✅"
             else:
-                print("   ℹ️ پاسخ /status چیز جدیدی نداشت (یا تکراری بود).")
+                result = f"{t}: پاسخ چیز جدیدی نداشت"
+            print("   " + result)
+            status_results.append(result)
 
     print(f"📨 {len(new_texts)} پیام آماده‌ی فرستادن به Worker.")
+    sent_ok = 0
     for text in new_texts:
         try:
             send_pending_to_worker(text)
+            sent_ok += 1
             print("   ➡️ با موفقیت به Worker فرستاده شد.")
         except Exception as e:
             print(f"   ❌ خطا در فرستادن به Worker: {e}")
@@ -259,6 +288,26 @@ def main():
     save_json(STATE_FILE, state)
     save_json(GROUPS_FILE, groups)
     print("💾 state.json و groups.json ذخیره شدن.")
+
+    # --- گزارش مانیتورینگ: همیشه فرستاده می‌شه، حتی وقتی هیچ اتفاق خاصی نیفتاده ---
+    now_str = datetime.now(TEHRAN_TZ).strftime("%Y-%m-%d %H:%M")
+    report = [
+        "🛠 <b>گزارش اجرای ریدر</b>",
+        f"🕐 {now_str} (تهران)",
+        "",
+        f"📡 پیام‌های منبع: {source_stats['checked']} بررسی شد، {source_stats['added']} خاموشی جدید"
+        + (" (baseline اولین اجرا)" if source_stats["first_run"] else ""),
+        f"👥 گروه‌ها: {group_stats['checked']} بررسی شد، {group_stats['activated']} تازه فعال شد",
+    ]
+    if status_lines:
+        report.append("⏱ ساعت‌های /status:")
+        report.extend(f"   • {line}" for line in status_lines)
+    if status_results:
+        report.append("📬 نتیجه‌ی /status:")
+        report.extend(f"   • {r}" for r in status_results)
+    report.append(f"📤 ارسال به Worker: {len(new_texts)} پیام ({sent_ok} موفق)")
+
+    send_log_to_worker("\n".join(report))
 
 
 if __name__ == "__main__":

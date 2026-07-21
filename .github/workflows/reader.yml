@@ -1,9 +1,8 @@
 name: Bargh Reader
 
 on:
-  schedule:
-    - cron: "*/30 * * * *"   # هر ۳۰ دقیقه = حدود ۱۴۴۰ دقیقه در ماه، زیر سقف ۲۰۰۰ دقیقه‌ی رایگان ریپوی Private
-  workflow_dispatch: {}
+  workflow_dispatch: {}   # دیگه به schedule خودِ گیت‌هاب اعتماد نمی‌کنیم (تاخیرش تا ۱-۲ ساعت هم می‌رسید)؛
+                          # از این به بعد Cloudflare Worker هر ۳۰ دقیقه این‌جا رو با API صدا می‌زنه
 
 concurrency:
   group: bargh-reader

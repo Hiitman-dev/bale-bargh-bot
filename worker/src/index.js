@@ -88,8 +88,9 @@ function mainMenuKeyboard(settings) {
       ],
       [
         { text: "⏱ زمان انتظار", callback_data: "menu:timeout" },
-        { text: "🕘 تاریخچه", callback_data: "menu:history" },
+        { text: "🕘 تاریخچه ارسال", callback_data: "menu:history" },
       ],
+      [{ text: "🛠 گزارش اجراها", callback_data: "menu:logs" }],
     ],
   };
 }
@@ -133,6 +134,16 @@ async function githubApi(env, method, path, body) {
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(`GitHub API error ${r.status}: ${JSON.stringify(data)}`);
   return data;
+}
+
+async function triggerReaderWorkflow(env) {
+  // چون گیت‌هاب schedule خودش رو با تاخیرهای غیرقابل‌پیش‌بینی (گاهی ۱-۲ ساعت) اجرا می‌کنه،
+  // به‌جاش از Cron Trigger دقیق‌تر کلادفلر برای صدا زدن workflow_dispatch استفاده می‌کنیم.
+  try {
+    await githubApi(env, "POST", "/actions/workflows/reader.yml/dispatches", { ref: env.GITHUB_BRANCH || "main" });
+  } catch (e) {
+    console.log("trigger reader workflow failed:", e.message);
+  }
 }
 
 function base64ToBytes(b64) {
@@ -220,6 +231,33 @@ async function handleGroupsApi(req, env) {
   return OK();
 }
 
+async function handleLogApi(req, env) {
+  if (req.headers.get("X-Reader-Secret") !== env.READER_SECRET) return ERR("unauthorized", 401);
+  const body = await req.json();
+  if (!body.text) return ERR("missing text");
+  const logs = await getJSON(env, "run_logs", []);
+  logs.push({ text: body.text, at: Date.now() });
+  await setJSON(env, "run_logs", logs.slice(-200));
+  return OK();
+}
+
+function runLogsText(logs) {
+  if (!logs.length) return "🛠 <b>گزارش اجراها</b>\n\nهنوز گزارشی ثبت نشده.";
+  const recent = logs.slice(-10).reverse();
+  return "🛠 <b>۱۰ گزارش آخر اجرا</b>\n\n" + recent.map((l) => l.text).join("\n\n━━━━━━━━━━━━━━\n\n");
+}
+
+async function pruneRunLogsIfDue(env) {
+  const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
+  const lastClearRaw = await env.BARGH_KV.get("run_logs_last_clear");
+  const lastClear = lastClearRaw ? parseInt(lastClearRaw, 10) : 0;
+  const now = Date.now();
+  if (now - lastClear >= THREE_DAYS_MS) {
+    await setJSON(env, "run_logs", []);
+    await env.BARGH_KV.put("run_logs_last_clear", String(now));
+  }
+}
+
 async function handleMenuCallback(data, env) {
   const groups = await getJSON(env, "groups", {});
   const settings = await getJSON(env, "settings", DEFAULT_SETTINGS);
@@ -229,6 +267,10 @@ async function handleMenuCallback(data, env) {
   if (data === "menu:history") {
     const history = await getJSON(env, "history", []);
     return sendToAdmin(env, historyText(history), BACK_KEYBOARD);
+  }
+  if (data === "menu:logs") {
+    const logs = await getJSON(env, "run_logs", []);
+    return sendToAdmin(env, runLogsText(logs), BACK_KEYBOARD);
   }
   if (data === "menu:status") {
     const pendingList = await env.BARGH_KV.list({ prefix: "pending:" });
@@ -383,6 +425,10 @@ async function handleTextMessage(text, env) {
     const history = await getJSON(env, "history", []);
     return sendToAdmin(env, historyText(history));
   }
+  if (text === "/logs") {
+    const logs = await getJSON(env, "run_logs", []);
+    return sendToAdmin(env, runLogsText(logs));
+  }
   if (text === "/help" || text === "/start") {
     return sendToAdmin(
       env,
@@ -390,6 +436,7 @@ async function handleTextMessage(text, env) {
         "از دکمه‌های زیر استفاده کن، یا این دستورات رو مستقیم بفرست:\n" +
         "<code>/setdefault 1,2</code> - تعیین گروه‌های مقصد پیش‌فرض\n" +
         "<code>/setdefault all</code> - ارسال به همه‌ی گروه‌ها\n" +
+        "<code>/logs</code> - گزارش اجراهای اخیر ریدر\n" +
         `<code>/setsecret NAME value</code> - تغییر ${EDITABLE_SECRETS.join(" یا ")} روی گیت‌هاب`,
       mainMenuKeyboard(settings)
     );
@@ -462,11 +509,17 @@ export default {
     const url = new URL(req.url);
     if (req.method === "POST" && url.pathname === "/api/pending") return handlePendingApi(req, env);
     if (req.method === "POST" && url.pathname === "/api/groups") return handleGroupsApi(req, env);
+    if (req.method === "POST" && url.pathname === "/api/log") return handleLogApi(req, env);
     if (req.method === "POST" && url.pathname === "/webhook") return handleWebhook(req, env);
     return new Response("bargh-manager worker is running", { status: 200 });
   },
 
   async scheduled(event, env, ctx) {
+    if (event.cron === "*/30 * * * *") {
+      ctx.waitUntil(triggerReaderWorkflow(env));
+      return;
+    }
     ctx.waitUntil(checkTimeouts(env));
+    ctx.waitUntil(pruneRunLogsIfDue(env));
   },
 };
