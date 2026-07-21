@@ -66,10 +66,14 @@ TEMPLATE = (
 
 
 def load_json(path, default):
-    if os.path.exists(path):
+    if not os.path.exists(path):
+        return default
+    try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    return default
+    except json.JSONDecodeError as e:
+        print(f"⚠️ فایل {path} خراب/نامعتبره ({e})، به‌جاش از مقدار پیش‌فرض شروع می‌کنم.")
+        return default
 
 
 def save_json(path, data):
