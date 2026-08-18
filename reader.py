@@ -96,6 +96,19 @@ def extract_outages(raw_text):
     return []
 
 
+def split_house_sections(raw_text):
+    """پیام ممکنه چند بلوک خونه‌ی جدا رو با هم داشته باشه (هر کدوم با یه خط 🏠 شروع
+    می‌شه، گاهی با خط جداکننده‌ی ──── بینشون، گاهی بدون اون). برای اینکه تاریخ/ساعت
+    هر خونه به اسم خودش نسبت داده بشه (نه به اولین خونه‌ی پیام)، پیام رو سر هر خط
+    🏠 می‌شکونیم و هر تیکه رو جدا برمی‌گردونیم."""
+    text = raw_text or ""
+    starts = [m.start() for m in LABEL_PATTERN.finditer(text)]
+    if not starts:
+        return [text]
+    starts.append(len(text))
+    return [text[starts[i]:starts[i + 1]] for i in range(len(starts) - 1)]
+
+
 def load_json(path, default):
     if not os.path.exists(path):
         return default
@@ -124,27 +137,30 @@ def prune_fingerprints(sent_fps, keep=200):
 
 
 def consider_text(raw_text, state, new_texts, first_run=False):
-    """اگه متن شامل یک یا چند تاریخ/ساعت خاموشی معتبر بود، برای هر کدوم که قبلاً
-    فرستاده نشده (بر اساس قبض+تاریخ+ساعت) یه پیام جدا فرمت می‌کنه و به لیست ارسال
-    اضافه می‌کنه. برمی‌گردونه که آیا حداقل یه مورد جدید اضافه شد یا نه."""
-    outages = extract_outages(raw_text)
-    if not outages:
-        return False
-
-    label = extract_label(raw_text)
+    """پیام ممکنه شامل یک یا چند بلوک خونه باشه، هر بلوک با یک یا چند تاریخ/ساعت.
+    هر بلوک مستقل پردازش می‌شه (تا اسم قبض‌ها با هم قاطی نشن)، و برای هر خاموشیِ
+    جدید (بر اساس قبض+تاریخ+ساعت) یه پیام جدا فرمت می‌شه. برمی‌گردونه که آیا حداقل
+    یه مورد جدید اضافه شد یا نه."""
+    sections = split_house_sections(raw_text)
     sent_fps = state.setdefault("sent_fingerprints", {})
     added_any = False
 
-    for outage in outages:
-        fp = outage_fingerprint(label, **outage)
-        if fp in sent_fps:
-            continue  # دقیقاً همین قبض+تاریخ+ساعت قبلاً فرستاده شده
-        if first_run:
-            sent_fps[fp] = "baseline"
+    for section in sections:
+        outages = extract_outages(section)
+        if not outages:
             continue
-        new_texts.append(TEMPLATE.format(label=label, **outage))
-        sent_fps[fp] = datetime.now(TEHRAN_TZ).strftime("%Y-%m-%d %H:%M")
-        added_any = True
+        label = extract_label(section)
+
+        for outage in outages:
+            fp = outage_fingerprint(label, **outage)
+            if fp in sent_fps:
+                continue  # دقیقاً همین قبض+تاریخ+ساعت قبلاً فرستاده شده
+            if first_run:
+                sent_fps[fp] = "baseline"
+                continue
+            new_texts.append(TEMPLATE.format(label=label, **outage))
+            sent_fps[fp] = datetime.now(TEHRAN_TZ).strftime("%Y-%m-%d %H:%M")
+            added_any = True
 
     return added_any
 
