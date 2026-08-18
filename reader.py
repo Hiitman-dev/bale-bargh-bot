@@ -51,18 +51,49 @@ TEHRAN_TZ = ZoneInfo("Asia/Tehran")
 STATE_FILE = "state.json"
 GROUPS_FILE = "groups.json"  # فقط رکورد محلی، برای جلوگیری از ثبت تکراری یک گروه
 
-# تنها معیار تشخیص «این پیام یه اطلاعیه‌ی خاموشیه» همینه — یه الگوی خیلی مشخص و کم‌ابهام،
-# به‌جای اینکه به عبارت‌های فارسی‌ای مثل "برنامه‌ریزی‌شده" وابسته باشیم که با نیم‌فاصله/فاصله
-# ممکنه به‌شکل‌های مختلف نوشته بشن و match رو بی‌صدا خراب کنن.
-DATETIME_PATTERN = re.compile(
+# اسم قبض (property) از خط اول پیام که با 🏠 شروع می‌شه استخراج می‌شه.
+# دو شکل ممکنه: «🏠 قبض: خونه خاله» یا «🏠 خانه ما» (خط مستقل به‌عنوان هدر).
+LABEL_PATTERN = re.compile(r"🏠\s*(?:قبض:\s*)?(?P<label>[^\n]+)")
+
+# دو فرمتی که ربات منبع برای تاریخ/ساعت خاموشی می‌فرسته:
+#  فرمت A (لیستی، معمولاً چند مورد زیر یک قبض): «• 1405/05/26 | 17:00 تا 19:15»
+#  فرمت B (تکی، پیام /status): «📅 تاریخ: 1405/05/27» ... «⏰ ساعت: 17:00 تا 19:15»
+DATETIME_PATTERN_LIST = re.compile(
     r"•\s*(?P<date>\d{4}/\d{2}/\d{2})\s*\|\s*(?P<start>\d{2}:\d{2})\s*تا\s*(?P<end>\d{2}:\d{2})"
+)
+DATETIME_PATTERN_SINGLE = re.compile(
+    r"📅\s*(?:<b>)?تاریخ:(?:</b>)?\s*(?P<date>\d{4}/\d{2}/\d{2}).*?"
+    r"⏰\s*(?:<b>)?ساعت:(?:</b>)?\s*(?P<start>\d{2}:\d{2})\s*تا\s*(?P<end>\d{2}:\d{2})",
+    re.DOTALL,
 )
 
 TEMPLATE = (
-    "⚡️ <b>اطلاعیه خاموشی برق</b>\n\n"
+    "⚡️ <b>اطلاعیه خاموشی برق: {label}</b>\n\n"
     "🗓 <b>تاریخ:</b> {date}\n"
     "⏰ <b>ساعت:</b> {start} تا {end}"
 )
+
+
+def extract_label(raw_text):
+    """اسم قبض رو از پیام استخراج می‌کنه. اگه پیدا نشد، یه مقدار پیش‌فرض برمی‌گردونه
+    تا کل پیام رد نشه (بهتره اطلاعیه بدون اسم بره تا اصلاً نره)."""
+    m = LABEL_PATTERN.search(raw_text or "")
+    if m:
+        return m.group("label").strip()
+    return "نامشخص"
+
+
+def extract_outages(raw_text):
+    """همه‌ی بازه‌های تاریخ/ساعت خاموشی رو از یه پیام استخراج می‌کنه (می‌تونه چندتا باشه).
+    هر آیتم یه dict با date/start/end هست."""
+    text = raw_text or ""
+    matches = [m.groupdict() for m in DATETIME_PATTERN_LIST.finditer(text)]
+    if matches:
+        return matches
+    m = DATETIME_PATTERN_SINGLE.search(text)
+    if m:
+        return [m.groupdict()]
+    return []
 
 
 def load_json(path, default):
@@ -81,8 +112,8 @@ def save_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def outage_fingerprint(date, start, end):
-    return f"{date}|{start}|{end}"
+def outage_fingerprint(label, date, start, end):
+    return f"{label}|{date}|{start}|{end}"
 
 
 def prune_fingerprints(sent_fps, keep=200):
@@ -93,21 +124,29 @@ def prune_fingerprints(sent_fps, keep=200):
 
 
 def consider_text(raw_text, state, new_texts, first_run=False):
-    """اگه متن شامل یه تاریخ/ساعت خاموشی معتبر بود و قبلاً فرستاده نشده، فرمتش کن
-    و به لیست ارسال اضافه کن. برمی‌گردونه که آیا چیزی جدید اضافه شد یا نه."""
-    m = DATETIME_PATTERN.search(raw_text or "")
-    if not m:
+    """اگه متن شامل یک یا چند تاریخ/ساعت خاموشی معتبر بود، برای هر کدوم که قبلاً
+    فرستاده نشده (بر اساس قبض+تاریخ+ساعت) یه پیام جدا فرمت می‌کنه و به لیست ارسال
+    اضافه می‌کنه. برمی‌گردونه که آیا حداقل یه مورد جدید اضافه شد یا نه."""
+    outages = extract_outages(raw_text)
+    if not outages:
         return False
-    fp = outage_fingerprint(**m.groupdict())
+
+    label = extract_label(raw_text)
     sent_fps = state.setdefault("sent_fingerprints", {})
-    if fp in sent_fps:
-        return False  # دقیقاً همین تاریخ/ساعت قبلاً فرستاده شده
-    if first_run:
-        sent_fps[fp] = "baseline"
-        return False
-    new_texts.append(TEMPLATE.format(**m.groupdict()))
-    sent_fps[fp] = datetime.now(TEHRAN_TZ).strftime("%Y-%m-%d %H:%M")
-    return True
+    added_any = False
+
+    for outage in outages:
+        fp = outage_fingerprint(label, **outage)
+        if fp in sent_fps:
+            continue  # دقیقاً همین قبض+تاریخ+ساعت قبلاً فرستاده شده
+        if first_run:
+            sent_fps[fp] = "baseline"
+            continue
+        new_texts.append(TEMPLATE.format(label=label, **outage))
+        sent_fps[fp] = datetime.now(TEHRAN_TZ).strftime("%Y-%m-%d %H:%M")
+        added_any = True
+
+    return added_any
 
 
 def send_pending_to_worker(text):
